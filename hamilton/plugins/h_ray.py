@@ -273,7 +273,6 @@ class RayTaskExecutor(executors.TaskExecutor):
         :param task: Task to wrap
         :return: A future
         """
-
         return executors.TaskFutureWrappingPythonFuture(
             ray.remote(executors.base_execute_task).remote(task=task).future()
         )

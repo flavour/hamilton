@@ -1739,7 +1739,7 @@ class Builder:
         if not allow_experimental_mode:
             raise ValueError(
                 "Remote execution is currently experimental. "
-                "Please set allow_experiemental_mode=True to enable it."
+                "Please set allow_experimental_mode=True to enable it."
             )
         self.v2_executor = True
         return self

@@ -1,8 +1,10 @@
+import asyncio
 import logging
 import pprint
 from typing import Any, Collection, Dict, List, Optional, Set, Tuple
 
 from hamilton import node
+from hamilton.async_utils import await_dict_of_tasks, process_value
 from hamilton.lifecycle.base import LifecycleAdapterSet
 
 logger = logging.getLogger(__name__)
@@ -282,6 +284,153 @@ def execute_subdag(
             # from the top level, we don't know if this UserInput is required. So mark as optional.
             dep_type = node.DependencyType.OPTIONAL
         dfs_traverse(final_var_node, dep_type)
+    return computed
+
+
+async def execute_subdag_async(
+    nodes: Collection[node.Node],
+    inputs: Dict[str, Any],
+    adapter: LifecycleAdapterSet = None,
+    computed: Dict[str, Any] = None,
+    overrides: Dict[str, Any] = None,
+    run_id: str = None,
+    task_id: str = None,
+) -> Dict[str, Any]:
+    """Base function to execute a subdag. This conducts a depth first traversal of the graph.
+
+    :param nodes: Nodes to compute
+    :param inputs: Inputs, external
+    :param adapter:  Adapter to use to compute
+    :param computed:  Already computed nodes
+    :param overrides: Overrides to use, will short-circuit computation
+    :param run_id: Run ID to use
+    :param task_id: Task ID to use -- this is optional for the purpose of the task-based execution...
+    :return: The results
+    """
+    if overrides is None:
+        overrides = {}
+    if computed is None:
+        computed = {}
+    nodes_to_compute = {node_.name for node_ in nodes}
+
+    if adapter is None:
+        adapter = LifecycleAdapterSet()
+
+    async def dfs_traverse(
+        node_: node.Node, dependency_type: node.DependencyType = node.DependencyType.REQUIRED
+    ):
+        if node_.name in computed:
+            return
+        if node_.name in overrides:
+            computed[node_.name] = overrides[node_.name]
+            return
+        for n in node_.dependencies:
+            if n.name not in computed:
+                _, node_dependency_type = node_.input_types[n.name]
+                await dfs_traverse(n, node_dependency_type)
+
+        logger.debug(f"Computing {node_.name}.")
+        if node_.user_defined:
+            if node_.name not in inputs:
+                if dependency_type != node.DependencyType.OPTIONAL:
+                    raise NotImplementedError(
+                        f"{node_.name} was expected to be passed in but was not."
+                    )
+                return
+            result = inputs[node_.name]
+        else:
+            kwargs = {}  # construct signature
+            for dependency in node_.dependencies:
+                if dependency.name in computed:
+                    kwargs[dependency.name] = computed[dependency.name]
+            task_dict = {key: process_value(value) for key, value in kwargs.items()}
+            fn_kwargs = await await_dict_of_tasks(task_dict)
+            error = None
+            result = None
+            success = True
+            pre_node_execute_errored = False
+            try:
+                if adapter.does_hook("pre_node_execute", is_async=True):
+                    try:
+                        await adapter.call_all_lifecycle_hooks_async(
+                            "pre_node_execute",
+                            run_id=run_id,
+                            node_=node_,
+                            kwargs=fn_kwargs,
+                            task_id=task_id,
+                        )
+                    except Exception as e:
+                        pre_node_execute_errored = True
+                        raise e
+                if adapter.does_method("do_node_execute", is_async=True):
+                    result = await adapter.call_lifecycle_method_async(
+                        "do_node_execute",
+                        run_id=run_id,
+                        node_=node_,
+                        kwargs=kwargs,
+                        task_id=task_id,
+                    )
+                else:
+                    fn = node_.callable
+                    result = (
+                        await fn(**fn_kwargs)
+                        if asyncio.iscoroutinefunction(fn)
+                        else fn(**fn_kwargs)
+                    )
+            except Exception as e:
+                success = False
+                error = e
+                step = "[pre-node-execute]" if pre_node_execute_errored else ""
+                message = create_error_message(kwargs, node_, step)
+                logger.exception(message)
+                raise
+            finally:
+                if not pre_node_execute_errored and adapter.does_hook(
+                    "post_node_execute", is_async=True
+                ):
+                    try:
+                        await adapter.call_all_lifecycle_hooks_async(
+                            "post_node_execute",
+                            run_id=run_id,
+                            node_=node_,
+                            kwargs=kwargs,
+                            success=success,
+                            error=error,
+                            result=result,
+                            task_id=task_id,
+                        )
+                    except Exception:
+                        message = create_error_message(kwargs, node_, "[post-node-execute]")
+                        logger.exception(message)
+                        raise
+
+        computed[node_.name] = result
+        # > pruning the graph
+        # This doesn't narrow it down to the entire space of the graph
+        # E.G. if something is not needed by this current execution due to
+        # the selection of nodes to run it might not prune everything.
+        # to do this we'd need to first determine all nodes on the path, then prune
+        # We may also want to use a reference counter for slightly cleaner/more efficient memory management
+
+        for dep in node_.dependencies:
+            if dep.name in computed and dep.name not in nodes_to_compute:
+                for downstream_node in dep.depended_on_by:
+                    # if it isn't computed, and it isn't required, we can't prune
+                    if (
+                        downstream_node.name not in computed
+                        or downstream_node.name in nodes_to_compute
+                    ):
+                        break
+                # If the result of this node is no longer needed, we can prune it/save the memory
+                else:
+                    del computed[dep.name]
+
+    for final_var_node in nodes:
+        dep_type = node.DependencyType.REQUIRED
+        if final_var_node.user_defined:
+            # from the top level, we don't know if this UserInput is required. So mark as optional.
+            dep_type = node.DependencyType.OPTIONAL
+        await dfs_traverse(final_var_node, dep_type)
     return computed
 
 

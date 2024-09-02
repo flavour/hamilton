@@ -6,7 +6,7 @@ from concurrent.futures import Executor, Future, ProcessPoolExecutor, ThreadPool
 from typing import Any, Callable, Dict, List
 
 from hamilton import node
-from hamilton.execution.graph_functions import execute_subdag
+from hamilton.execution.graph_functions import execute_subdag, execute_subdag_async
 from hamilton.execution.grouping import NodeGroupPurpose, TaskImplementation
 from hamilton.execution.state import ExecutionState, GraphState, TaskState
 
@@ -151,6 +151,80 @@ def base_execute_task(task: TaskImplementation) -> Dict[str, Any]:
     return final_retval
 
 
+async def base_execute_task_async(task: TaskImplementation) -> Dict[str, Any]:
+    """This is a utility function to execute a base task. In an ideal world this would be recursive,
+    (as in we can use the same task execution/management system as we would otherwise)
+    but for now we just call out to good old DFS. Note that this only returns the result that
+    a task is required to output, and does not return anything else. It also returns
+    any overrides.
+
+    We should probably have a simple way of doing this for single-node tasks, as they're
+    going to be common.
+
+    :param task: task to execute.
+    :return: a diciontary of the results of all the nodes in that task's nodes to compute.
+    """
+    # We do this as an edge case to force the callable to return a list if it is an expand,
+    # and would normally return a generator. That said, we will likely remove this in the future --
+    # its an implementation detail, and a true queuing system between nodes/controller would mean
+    # we wouldn't need to do this, and instead could just use the generator aspect.
+    # Furthermore, in most cases the user wouldn't be calling an expand on a "remote" node,
+    # but it is a supported use-case.
+    for node_ in task.nodes:
+        if not getattr(node_, "callable_modified", False):
+            node_._callable = _modify_callable(node_.node_role, node_.callable)
+        node_.callable_modified = True
+    if task.adapter.does_hook("pre_task_execute", is_async=True):
+        await task.adapter.call_all_lifecycle_hooks_async(
+            "pre_task_execute",
+            run_id=task.run_id,
+            task_id=task.task_id,
+            nodes=task.nodes,
+            inputs=task.dynamic_inputs,
+            overrides=task.overrides,
+        )
+    error = None
+    success = True
+    results = None
+    try:
+        results = await execute_subdag_async(
+            nodes=task.nodes,
+            inputs=task.dynamic_inputs,
+            adapter=task.adapter,
+            overrides={**task.dynamic_inputs, **task.overrides},
+            run_id=task.run_id,
+            task_id=task.task_id,
+        )
+    except Exception as e:
+        logger.exception(task.task_id)
+        error = e
+        success = False
+        logger.exception(
+            f"Exception executing task {task.task_id}, with nodes: {[item.name for item in task.nodes]}"
+        )
+        raise e
+    finally:
+        if task.adapter.does_hook("post_task_execute", is_async=True):
+            await task.adapter.call_all_lifecycle_hooks_async(
+                "post_task_execute",
+                run_id=task.run_id,
+                task_id=task.task_id,
+                nodes=task.nodes,
+                results=results,
+                success=success,
+                error=error,
+            )
+    # This selection is for GC
+    # We also need to get the override values
+    # This way if its overridden we can ensure it gets passed to the right one
+    final_retval = {
+        key: value
+        for key, value in results.items()
+        if key in task.outputs_to_compute or key in task.overrides
+    }
+    return final_retval
+
+
 class SynchronousLocalTaskExecutor(TaskExecutor):
     """Basic synchronous/local task executor that runs tasks
     in the same process, at submit time."""
@@ -163,6 +237,34 @@ class SynchronousLocalTaskExecutor(TaskExecutor):
         """
         # No error management for now
         result = base_execute_task(task)
+        return TaskFuture(get_state=lambda: TaskState.SUCCESSFUL, get_result=lambda: result)
+
+    def can_submit_task(self) -> bool:
+        """We can always submit a task as the task submission is blocking!
+
+        :return: True
+        """
+        return True
+
+    def init(self):
+        pass
+
+    def finalize(self):
+        pass
+
+
+class AsynchronousLocalTaskExecutor(TaskExecutor):
+    """Basic asynchronous/local task executor that runs tasks
+    in the same event loop at submit time."""
+
+    async def submit_task(self, task: TaskImplementation) -> TaskFuture:
+        """Submitting a task is literally just running it.
+
+        :param task: Task to submit
+        :return: Future associated with this task
+        """
+        # No error management for now
+        result = await base_execute_task_async(task)
         return TaskFuture(get_state=lambda: TaskState.SUCCESSFUL, get_result=lambda: result)
 
     def can_submit_task(self) -> bool:
@@ -379,6 +481,54 @@ def run_graph_to_completion(
                 if task_executor.can_submit_task():
                     try:
                         submitted = task_executor.submit_task(next_task)
+                    except Exception as e:
+                        logger.exception(
+                            f"Exception submitting task {next_task.task_id}, with nodes: "
+                            f"{[item.name for item in next_task.nodes]}"
+                        )
+                        raise e
+                    task_futures[next_task.task_id] = submitted
+                else:
+                    # Whoops, back on the queue
+                    # We should probably wait a bit here, but for now we're going to keep
+                    # burning through
+                    execution_state.reject_task(task_to_reject=next_task)
+            # update all the tasks in flight
+            # copy so we can modify
+            for task_name, task_future in task_futures.copy().items():
+                state = task_future.get_state()
+                result = task_future.get_result()
+                execution_state.update_task_state(task_name, state, result)
+                if TaskState.is_terminal(state):
+                    del task_futures[task_name]
+        logger.info(f"Graph is done, graph state is {execution_state.get_graph_state()}")
+    finally:
+        execution_manager.finalize()
+
+
+async def run_graph_to_completion_async(
+    execution_state: ExecutionState,
+    execution_manager: ExecutionManager,
+):
+    """Blocking call to run the graph until it is complete. Note that this employs a while loop.
+    With the way we handle futures, we should be able to have this event-driven, allowing us
+    to only query when the state is updated, and use that to trigger a new update.
+
+    For now, the while loop is fine.
+
+    :return: Nothing, the execution state/result cache can give us the data
+    """
+    task_futures = {}
+    execution_manager.init()
+    try:
+        while not GraphState.is_terminal(execution_state.get_graph_state()):
+            # get the next task from the queue
+            next_task = execution_state.release_next_task()
+            if next_task is not None:
+                task_executor = execution_manager.get_executor_for_task(next_task)
+                if task_executor.can_submit_task():
+                    try:
+                        submitted = await task_executor.submit_task(next_task)
                     except Exception as e:
                         logger.exception(
                             f"Exception submitting task {next_task.task_id}, with nodes: "
